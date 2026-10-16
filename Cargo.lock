@@ -397,6 +397,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "cpal",
+ "flate2",
  "sha2",
  "ureq",
 ]

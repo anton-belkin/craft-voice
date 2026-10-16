@@ -30,6 +30,7 @@ candle-transformers = "0.11"
 cpal = "0.18"
 ureq = "3"
 sha2 = { version = "0.11", default-features = false }
+flate2 = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11", features = ["metal"] }

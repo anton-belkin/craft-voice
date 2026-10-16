@@ -69,3 +69,108 @@ fn speech_becomes_text_with_markers() {
     // Silence is nothing, not a hallucinated "Thank you".
     assert!(got[&3].is_empty(), "{:?}", got[&3]);
 }
+
+/// Phrases spoken one after another with a pause between them: the audio and when each phrase
+/// starts and ends.
+fn phrases(voice: &str, texts: &[&str], gap: f32) -> Option<(Audio, Vec<(f32, f32)>)> {
+    let mut samples = vec![];
+    let mut spans = vec![];
+    for t in texts {
+        let a = speech(voice, t)?;
+        let start = samples.len() as f32 / 16_000.0;
+        samples.extend_from_slice(&a.samples);
+        spans.push((start, samples.len() as f32 / 16_000.0));
+        samples.extend(std::iter::repeat_n(0.0, (gap * 16_000.0) as usize));
+    }
+    Some((Audio { samples }, spans))
+}
+
+fn transcribe_one(audio: Audio) -> Option<craft_voice::Transcript> {
+    let (model, dir) = ready_model()?;
+    let t = Transcriber::start(model, dir, Options { languages: vec!["ru".into(), "en".into()] }, || {});
+    t.transcribe(1, audio);
+    loop {
+        match t.wait(Duration::from_secs(600)) {
+            Some(Event::Text { transcript, .. }) => return Some(transcript),
+            Some(Event::Failed { error, .. }) => panic!("{error}"),
+            Some(_) => {}
+            None => panic!("timed out"),
+        }
+    }
+}
+
+fn count(hay: &str, needle: &str) -> usize {
+    hay.to_lowercase().matches(&needle.to_lowercase()).count()
+}
+
+/// Speech longer than Whisper's 30-second window, with a phrase across the boundary: each phrase
+/// comes out once (the unfinished phrase at the end of a window was decoded twice before).
+#[test]
+fn long_speech_is_not_repeated_across_windows() {
+    if ready_model().is_none() {
+        eprintln!("skipped: no small model");
+        return;
+    }
+    let texts = [
+        "А почему здесь девятьсот тысяч?",
+        "Так, а здесь два с половиной миллиона. Почему?",
+        "Валовая прибыль, кажется, выглядит нормально.",
+        "Посмотри на маркетинг вот в этой строке.",
+        "Откуда взялся рост клиентов в марте?",
+        "И почему отток такой маленький?",
+        "Проверь, пожалуйста, цены за место.",
+        "Сколько стоит обслуживание одного клиента и кто его посчитал?",
+        "А здесь операционные расходы почти не растут.",
+        "Объясни, как считается средняя база клиентов.",
+    ];
+    let Some((mut audio, mut spans)) = phrases("Milena", &texts, 0.6) else {
+        eprintln!("skipped: no `say`");
+        return;
+    };
+    // A longer pause before phrase 8 so that it starts at 28.5 s and runs across the 30-second
+    // window boundary.
+    if spans[7].0 < 28.5 {
+        let pad = 28.5 - spans[7].0;
+        let at = (spans[7].0 * 16_000.0) as usize;
+        audio.samples.splice(at..at, std::iter::repeat_n(0.0, (pad * 16_000.0) as usize));
+        for s in spans.iter_mut().skip(7) {
+            *s = (s.0 + pad, s.1 + pad);
+        }
+    }
+    let straddles = spans[7].0 < 29.0 && spans[7].1 > 30.5;
+    assert!(straddles, "{spans:?}");
+    eprintln!("{:.1} s, phrase across 30 s: {straddles}", audio.seconds());
+    let t = transcribe_one(audio).unwrap();
+    eprintln!("{}", t.text);
+    for w in ["девятьсот", "900", "миллион", "маркетинг", "отток", "обслуживание", "операционные", "средняя"]
+    {
+        assert!(count(&t.text, w) <= 1, "`{w}` said more than once: {}", t.text);
+    }
+    assert!(count(&t.text, "обслуживание") == 1 && count(&t.text, "средняя") == 1, "{}", t.text);
+    // Segments go forward in time.
+    assert!(t.segments.windows(2).all(|w| w[1].start >= w[0].start - 0.05), "{:?}", t.segments);
+}
+
+/// Clicks at known moments land in the phrase being spoken at that moment.
+#[test]
+fn markers_land_in_the_phrase_being_spoken() {
+    if ready_model().is_none() {
+        eprintln!("skipped: no small model");
+        return;
+    }
+    let texts = ["Почему выручка здесь такая большая?", "Расходы почти не меняются два года.", "А маржа выглядит слишком хорошо."];
+    let Some((audio, spans)) = phrases("Milena", &texts, 1.0) else {
+        eprintln!("skipped: no `say`");
+        return;
+    };
+    let mid = |(a, b): (f32, f32)| a + (b - a) * 0.5;
+    let pointers = [Pointer { at: mid(spans[0]), anchor: "B15" }, Pointer { at: mid(spans[2]), anchor: "B19" }];
+    let t = transcribe_one(audio).unwrap();
+    let s = splice(&t, &pointers);
+    eprintln!("{}\n{:?}", s.text, t.segments);
+    let lower = s.text.to_lowercase();
+    let at = |w: &str| lower.find(w).unwrap_or_else(|| panic!("no `{w}` in {}", s.text));
+    // ⟦1⟧ inside the first phrase, ⟦2⟧ inside the third.
+    assert!(at("⟦1⟧") > at("почему") && at("⟦1⟧") < at("расходы"), "{}", s.text);
+    assert!(at("⟦2⟧") > at("марж"), "{}", s.text);
+}

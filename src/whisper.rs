@@ -207,16 +207,40 @@ impl Engine {
                 language = self.detect_language(&features)?;
             }
             let lang_token = self.special.language_token(&language);
-            let (segs, last_ts) = self.decode(&features, lang_token, offset, window_secs)?;
-            segments.extend(segs);
-            // Next window: right after the last complete segment, or the whole window.
-            let advance = match last_ts {
-                Some(t) if content_frames - seek > m::N_FRAMES && t > 1.0 => (t * m::SAMPLE_RATE as f32 / m::HOP_LENGTH as f32) as usize,
-                _ => in_window,
+            // Greedy first; when the text loops (compresses too well) or the model is unsure,
+            // again at rising temperatures, as OpenAI's Whisper does.
+            let mut best: Option<Decoded> = None;
+            for (k, &temperature) in m::TEMPERATURES.iter().enumerate() {
+                let d = self.decode(&features, lang_token, temperature, (seek as u64) << 8 | k as u64)?;
+                let silent = d.no_speech > m::NO_SPEECH_THRESHOLD && d.avg_logprob < m::LOGPROB_THRESHOLD;
+                let looping = compression_ratio(&self.text_of(&d.tokens)) > m::COMPRESSION_RATIO_THRESHOLD;
+                let unsure = d.avg_logprob < m::LOGPROB_THRESHOLD;
+                let done = silent || (!looping && !unsure);
+                if self.profile {
+                    eprintln!("craft-voice: t={temperature} logprob {:.2} looping {looping} silent {silent}", d.avg_logprob);
+                }
+                best = Some(d);
+                if done {
+                    break;
+                }
+            }
+            let Some(d) = best else { break };
+            let parsed = if d.no_speech > m::NO_SPEECH_THRESHOLD && d.avg_logprob < m::LOGPROB_THRESHOLD {
+                Parsed::default()
+            } else {
+                parse_segments(&d.tokens, &self.special, &self.vocab, offset, window_secs)
             };
+            let (keep, advance) = stitch(parsed, content_frames - seek > m::N_FRAMES, in_window);
+            segments.extend(keep);
             seek += advance.max(1);
         }
-        Ok(Transcript::from_segments(segments, language))
+        Ok(Transcript::from_segments(dedupe(segments), language))
+    }
+
+    fn text_of(&self, tokens: &[u32]) -> String {
+        let bytes: Vec<u8> =
+            tokens.iter().filter(|&&t| t < self.special.eot).filter_map(|&t| self.vocab.get(t as usize)).flatten().copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn logits(&mut self, tokens: &[u32], features: &Tensor, flush: bool) -> Result<Vec<f32>> {
@@ -251,9 +275,8 @@ impl Engine {
         Ok(best.map(|(c, _)| c.to_string()).unwrap_or_else(|| "en".into()))
     }
 
-    /// Greedy decoding of one window with timestamps. Returns its segments (times include
-    /// `offset`) and the last timestamp that closed a segment (seconds into the window).
-    fn decode(&mut self, features: &Tensor, lang: Option<u32>, offset: f32, window_secs: f32) -> Result<(Vec<Segment>, Option<f32>)> {
+    /// Decodes one window with timestamps: greedy at temperature 0, sampled above it.
+    fn decode(&mut self, features: &Tensor, lang: Option<u32>, temperature: f64, seed: u64) -> Result<Decoded> {
         let s = self.special;
         let mut tokens: Vec<u32> = vec![s.sot];
         tokens.extend(lang);
@@ -262,6 +285,7 @@ impl Engine {
         let vocab = self.config.vocab_size;
         let mut sum_logprob = 0.0f64;
         let mut no_speech = 0.0f64;
+        let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
         let t_dec = std::time::Instant::now();
         let mut steps = 0usize;
         for i in 0..self.max_tokens {
@@ -274,10 +298,10 @@ impl Engine {
             if i == 0 {
                 no_speech = softmax_at(&head, s.no_speech as usize);
             }
-            apply_rules(&mut logits, &tokens[begin..], &s, i == 0);
-            let (best, _) = logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |acc, (k, &v)| if v > acc.1 { (k, v) } else { acc });
-            sum_logprob += log_softmax_at(&logits, best);
-            let tok = best as u32;
+            apply_rules(&mut logits, tokens.get(begin..).unwrap_or_default(), &s, i == 0);
+            let pick = if temperature > 0.0 { sample(&logits, temperature, &mut rng) } else { argmax(&logits) };
+            sum_logprob += log_softmax_at(&logits, pick);
+            let tok = pick as u32;
             if tok == s.eot {
                 break;
             }
@@ -289,45 +313,139 @@ impl Engine {
         if self.profile {
             eprintln!("craft-voice: decoder {steps} steps, {:.0} ms", t_dec.elapsed().as_secs_f64() * 1e3);
         }
-        let generated = &tokens[begin..];
+        let generated: Vec<u32> = tokens.get(begin..).unwrap_or_default().to_vec();
         let avg_logprob = sum_logprob / (generated.len().max(1) as f64);
-        if no_speech > m::NO_SPEECH_THRESHOLD && avg_logprob < m::LOGPROB_THRESHOLD {
-            return Ok((vec![], None));
+        Ok(Decoded { tokens: generated, avg_logprob, no_speech })
+    }
+}
+
+/// One window's decoding.
+struct Decoded {
+    tokens: Vec<u32>,
+    avg_logprob: f64,
+    no_speech: f64,
+}
+
+/// A window's segments: those closed by a timestamp, the unfinished one after them, and the
+/// last closing timestamp (seconds into the window).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Parsed {
+    pub closed: Vec<Segment>,
+    pub trailing: Option<Segment>,
+    pub last_closed: Option<f32>,
+}
+
+/// Timestamp tokens around text → segments (times include `offset`).
+pub(crate) fn parse_segments(generated: &[u32], s: &Special, vocab: &[Vec<u8>], offset: f32, window_secs: f32) -> Parsed {
+    let mut out = Parsed::default();
+    let mut start: Option<f32> = None;
+    let mut text: Vec<u8> = vec![];
+    let seg = |st: f32, end: f32, text: &[u8]| Segment {
+        start: offset + st,
+        end: offset + end.max(st),
+        text: String::from_utf8_lossy(text).trim().to_string(),
+    };
+    for &t in generated {
+        if t >= s.ts_begin {
+            let at = (t - s.ts_begin) as f32 * TS_STEP;
+            if !text.is_empty() {
+                // Text since the last timestamp: it ends here (and the next text starts here,
+                // whether or not the model repeats this timestamp).
+                let st = start.unwrap_or(at);
+                out.closed.push(seg(st, at, &text));
+                text.clear();
+                out.last_closed = Some(at);
+            }
+            start = Some(at);
+        } else if t < s.eot
+            && let Some(b) = vocab.get(t as usize)
+        {
+            text.extend_from_slice(b);
         }
-        // Timestamp pairs around text.
-        let mut segments = vec![];
-        let mut start: Option<f32> = None;
-        let mut text: Vec<u8> = vec![];
-        let mut last_closed = None;
-        for &t in generated {
-            if t >= s.ts_begin {
-                let at = (t - s.ts_begin) as f32 * TS_STEP;
-                match start {
-                    Some(st) if !text.is_empty() => {
-                        segments.push(Segment {
-                            start: offset + st,
-                            end: offset + at.max(st),
-                            text: String::from_utf8_lossy(&text).trim().to_string(),
-                        });
-                        text.clear();
-                        start = None;
-                        last_closed = Some(at);
-                    }
-                    _ => start = Some(at),
-                }
-            } else if t < s.eot
-                && let Some(b) = self.vocab.get(t as usize)
-            {
-                text.extend_from_slice(b);
+    }
+    if !text.is_empty() {
+        let st = start.unwrap_or(0.0);
+        out.trailing = Some(seg(st, window_secs, &text));
+    }
+    out.closed.retain(|g| !g.text.is_empty());
+    out.trailing = out.trailing.filter(|g| !g.text.is_empty());
+    out
+}
+
+/// What a window adds and how far the next one starts (in mel frames). When speech goes on past
+/// this window, the next one starts right after the last complete segment and the unfinished one
+/// is left to it: keeping it here too would say it twice.
+pub(crate) fn stitch(parsed: Parsed, more: bool, in_window: usize) -> (Vec<Segment>, usize) {
+    let mut keep = parsed.closed;
+    match parsed.last_closed {
+        Some(t) if more && t > 1.0 => (keep, ((t * m::SAMPLE_RATE as f32 / m::HOP_LENGTH as f32) as usize).min(in_window)),
+        _ => {
+            keep.extend(parsed.trailing);
+            (keep, in_window)
+        }
+    }
+}
+
+/// Drops a segment that repeats the one before it over the same stretch of audio (a window
+/// boundary decoded twice); a sentence really said twice has its own time and stays.
+pub(crate) fn dedupe(segments: Vec<Segment>) -> Vec<Segment> {
+    let norm = |t: &str| t.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
+    let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+    for g in segments {
+        if let Some(prev) = out.last() {
+            let overlap = (prev.end.min(g.end) - prev.start.max(g.start)).max(0.0);
+            let shorter = (g.end - g.start).min(prev.end - prev.start).max(0.01);
+            if overlap / shorter > 0.5 && norm(&prev.text) == norm(&g.text) {
+                continue;
             }
         }
-        if !text.is_empty() {
-            let st = start.unwrap_or(0.0);
-            segments.push(Segment { start: offset + st, end: offset + window_secs.max(st), text: String::from_utf8_lossy(&text).trim().to_string() });
-        }
-        segments.retain(|g| !g.text.is_empty());
-        Ok((segments, last_closed))
+        out.push(g);
     }
+    out
+}
+
+/// How well text compresses (zlib): Whisper's sign of a decoding loop above 2.4.
+pub(crate) fn compression_ratio(text: &str) -> f64 {
+    use std::io::Write;
+    if text.is_empty() {
+        return 0.0;
+    }
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let compressed = z.write_all(text.as_bytes()).and_then(|()| z.finish()).map(|v| v.len()).unwrap_or(text.len());
+    text.len() as f64 / compressed.max(1) as f64
+}
+
+fn argmax(logits: &[f32]) -> usize {
+    logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |acc, (k, &v)| if v > acc.1 { (k, v) } else { acc }).0
+}
+
+/// A small deterministic generator (xorshift), so a retry is reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn next_f64(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn sample(logits: &[f32], temperature: f64, rng: &mut Rng) -> usize {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return argmax(logits);
+    }
+    let w: Vec<f64> = logits.iter().map(|&v| (f64::from(v - max) / temperature).exp()).collect();
+    let total: f64 = w.iter().sum();
+    let mut x = rng.next_f64() * total;
+    for (k, p) in w.iter().enumerate() {
+        x -= p;
+        if x <= 0.0 && *p > 0.0 {
+            return k;
+        }
+    }
+    argmax(logits)
 }
 
 fn softmax_at(logits: &[f32], k: usize) -> f64 {
@@ -400,6 +518,7 @@ pub(crate) fn apply_rules(logits: &mut [f32], generated: &[u32], s: &Special, fi
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
@@ -413,6 +532,61 @@ mod tests {
         let t = Special::for_vocab(51866);
         assert_eq!((t.transcribe, t.no_speech, t.no_timestamps, t.ts_begin), (50360, 50363, 50364, 50365));
         assert_eq!(t.language_token("yue"), Some(50258 + 100));
+    }
+
+    fn vocab() -> Vec<Vec<u8>> {
+        // Token k is the word "w<k> " for the few ids the tests use.
+        (0..200).map(|k| format!(" w{k}").into_bytes()).collect()
+    }
+
+    #[test]
+    fn segments_from_timestamp_tokens() {
+        let s = Special::for_vocab(51865);
+        let ts = |sec: f32| s.ts_begin + (sec / TS_STEP).round() as u32;
+        // <|0.00|> w1 w2 <|2.00|><|2.00|> w3 <|3.50|> w4 (unfinished: speech goes on)
+        let tokens = [ts(0.0), 1, 2, ts(2.0), ts(2.0), 3, ts(3.5), 4];
+        let p = parse_segments(&tokens, &s, &vocab(), 30.0, 28.0);
+        assert_eq!(p.closed.len(), 2);
+        assert_eq!((p.closed[0].start, p.closed[0].end, p.closed[0].text.as_str()), (30.0, 32.0, "w1 w2"));
+        assert_eq!((p.closed[1].start, p.closed[1].end), (32.0, 33.5));
+        assert_eq!(p.last_closed, Some(3.5));
+        let t = p.trailing.unwrap();
+        assert_eq!((t.start, t.end, t.text.as_str()), (33.5, 58.0, "w4"));
+        // A single timestamp between two pieces of text still ends one and starts the next.
+        let p = parse_segments(&[ts(0.0), 1, ts(1.0), 2, ts(2.0)], &s, &vocab(), 0.0, 5.0);
+        assert_eq!(p.closed.iter().map(|g| (g.start, g.end)).collect::<Vec<_>>(), vec![(0.0, 1.0), (1.0, 2.0)]);
+        assert!(p.trailing.is_none());
+    }
+
+    #[test]
+    fn an_unfinished_segment_is_left_to_the_next_window() {
+        let g = |a: f32, b: f32, t: &str| Segment { start: a, end: b, text: t.into() };
+        let parsed = || Parsed { closed: vec![g(0.0, 26.7, "one")], trailing: Some(g(26.7, 30.0, "two, cut")), last_closed: Some(26.7) };
+        // More speech after this window: "two" is decoded again by the next one, from 26.7 s.
+        let (keep, advance) = stitch(parsed(), true, 3000);
+        assert_eq!(keep.iter().map(|g| g.text.as_str()).collect::<Vec<_>>(), vec!["one"]);
+        assert_eq!(advance, 2670);
+        // The last window: everything stays.
+        let (keep, advance) = stitch(parsed(), false, 1200);
+        assert_eq!(keep.len(), 2);
+        assert_eq!(advance, 1200);
+    }
+
+    #[test]
+    fn a_window_boundary_decoded_twice_is_said_once() {
+        let g = |a: f32, b: f32, t: &str| Segment { start: a, end: b, text: t.into() };
+        let out = dedupe(vec![g(0.0, 3.0, "А почему здесь 900?"), g(0.2, 3.1, "а почему здесь 900"), g(3.0, 5.0, "Так.")]);
+        assert_eq!(out.len(), 2);
+        // Said twice for real (one after the other): both stay.
+        let out = dedupe(vec![g(0.0, 3.0, "Почему здесь 900?"), g(3.2, 6.0, "Почему здесь 900?")]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn loops_compress_well() {
+        assert!(compression_ratio(&"а почему здесь 900? ".repeat(12)) > 2.4);
+        assert!(compression_ratio("Почему выручка в двадцать восьмом году намного выше, чем вот эта цифра?") < 2.4);
+        assert_eq!(compression_ratio(""), 0.0);
     }
 
     #[test]

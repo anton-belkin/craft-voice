@@ -7,7 +7,9 @@ point at what you mean while speaking, release. The question goes on in the back
   time base for pointing events.
 - **`Transcriber`**: OpenAI Whisper on a worker thread with [candle](https://github.com/huggingface/candle)
   (Metal on macOS, the CPU elsewhere). Downloads the model on first use, reports progress, warms
-  the GPU up, then transcribes jobs in order. Results are `Event`s with a `Transcript`: text,
+  the GPU up, then transcribes jobs in order. Speech longer than Whisper's 30-second window is
+  stitched without repeating the phrase cut at the boundary; a decoding that loops (compresses
+  too well) or is unsure is redone at rising temperatures, as OpenAI's Whisper does. Results are `Event`s with a `Transcript`: text,
   language and timed segments.
 - **`splice(transcript, pointers)`**: puts `⟦n⟧` into the text for every pointer, where the user
   was in their speech at that moment (interpolated over the segment's characters by time, rounded
